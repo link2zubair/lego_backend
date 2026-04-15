@@ -17,16 +17,81 @@ from typing import Optional, AsyncGenerator
 import cv2
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from ultralytics import YOLO
 import google.generativeai as genai
+from dotenv import load_dotenv
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+import database as db_module
+import models
+
+load_dotenv()
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ─── Auth Config ─────────────────────────────────────────────────────────────
+SECRET_KEY  = os.getenv("SECRET_KEY", "legovision-secret-change-me")
+ALGORITHM  = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+http_bearer = HTTPBearer(auto_error=False)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_token(data: dict, expires_delta: datetime.timedelta) -> str:
+    payload = data.copy()
+    payload["exp"] = datetime.datetime.utcnow() + expires_delta
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_access_token(user_id: str) -> str:
+    return create_token(
+        {"sub": user_id, "type": "access"},
+        datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+
+
+def create_refresh_token(user_id: str) -> str:
+    return create_token(
+        {"sub": user_id, "type": "refresh"},
+        datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(http_bearer),
+    session: AsyncSession = Depends(db_module.get_db),
+) -> Optional[models.User]:
+    """Decode the Bearer token and return the User (or None for optional guards)."""
+    if credentials is None:
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            return None
+    except JWTError:
+        return None
+    result = await session.execute(select(models.User).where(models.User.id == user_id))
+    return result.scalar_one_or_none()
 
 # ─── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -110,12 +175,22 @@ def get_gemini() -> genai.GenerativeModel:
 
 @app.on_event("startup")
 async def startup_event():
-    """Pre-load YOLO model and configure Gemini on startup."""
+    """Pre-load YOLO model, configure Gemini, and create DB tables on startup."""
+    # ── Create PostgreSQL tables ──────────────────────────────────────────────
+    try:
+        async with db_module.engine.begin() as conn:
+            await conn.run_sync(db_module.Base.metadata.create_all)
+        logger.info("PostgreSQL tables created / verified ✓")
+    except Exception as e:
+        logger.error("DB startup error: %s", e)
+
+    # ── YOLO ──────────────────────────────────────────────────────────────────
     try:
         get_model()
     except RuntimeError as e:
         logger.warning("YOLO: %s", e)
 
+    # ── Gemini ────────────────────────────────────────────────────────────────
     try:
         get_gemini()
     except RuntimeError as e:
@@ -402,32 +477,77 @@ async def call_gemini(context: str, query: str, pil_image: Optional[Image.Image]
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", response_model=AuthTokensResponse, tags=["Auth"], status_code=201)
-async def auth_register(req: AuthRegisterRequest):
-    return AuthTokensResponse(
-        access_token=f"mock_access_{uuid.uuid4().hex[:8]}",
-        refresh_token=f"mock_refresh_{uuid.uuid4().hex[:8]}"
+async def auth_register(
+    req: AuthRegisterRequest,
+    session: AsyncSession = Depends(db_module.get_db),
+):
+    """Register a new user. Returns JWT tokens on success."""
+    # Check duplicate email
+    existing = await session.execute(
+        select(models.User).where(models.User.email == req.email.lower().strip())
     )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Email already registered.")
+
+    user = models.User(
+        id=str(uuid.uuid4()),
+        email=req.email.lower().strip(),
+        display_name=req.display_name,
+        hashed_password=hash_password(req.password),
+    )
+    session.add(user)
+    await session.commit()
+    logger.info("New user registered: %s", user.email)
+
+    return AuthTokensResponse(
+        access_token=create_access_token(user.id),
+        refresh_token=create_refresh_token(user.id),
+    )
+
 
 @app.post("/auth/login", response_model=AuthTokensResponse, tags=["Auth"])
-async def auth_login(req: AuthLoginRequest):
-    if not req.email or not req.password:
-        raise HTTPException(status_code=400, detail="Missing email or password")
+async def auth_login(
+    req: AuthLoginRequest,
+    session: AsyncSession = Depends(db_module.get_db),
+):
+    """Login with email + password. Returns JWT tokens on success."""
+    result = await session.execute(
+        select(models.User).where(models.User.email == req.email.lower().strip())
+    )
+    user = result.scalar_one_or_none()
+
+    if not user or not verify_password(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account is disabled.")
+
+    logger.info("User logged in: %s", user.email)
     return AuthTokensResponse(
-        access_token=f"mock_access_{uuid.uuid4().hex[:8]}",
-        refresh_token=f"mock_refresh_{uuid.uuid4().hex[:8]}"
+        access_token=create_access_token(user.id),
+        refresh_token=create_refresh_token(user.id),
     )
 
+
 @app.get("/auth/me", response_model=AuthUserResponse, tags=["Auth"])
-async def auth_me():
+async def auth_me(
+    current_user: Optional[models.User] = Depends(get_current_user),
+):
+    """Return the currently authenticated user's profile."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
     return AuthUserResponse(
-        id=str(uuid.uuid4()),
-        email="builder@legovision.com",
-        display_name="Master Builder",
-        created_at=datetime.datetime.now(datetime.timezone.utc).isoformat()
+        id=current_user.id,
+        email=current_user.email,
+        display_name=current_user.display_name,
+        avatar_url=current_user.avatar_url,
+        created_at=current_user.created_at.isoformat(),
     )
+
 
 @app.post("/auth/logout", tags=["Auth"])
 async def auth_logout():
+    """Client-side logout — simply discard the JWT token."""
     return {"message": "Logged out successfully"}
 
 
@@ -598,6 +718,29 @@ async def analyze(
 
     llm_answer = await call_gemini(context, query, pil_image=None)
 
+    # ── Persist scan to PostgreSQL ────────────────────────────────────────────
+    try:
+        current_user = await get_current_user(None)  # optional auth
+        async with db_module.AsyncSessionLocal() as session:
+            scan = models.ScanHistory(
+                id=f"scan-{uuid.uuid4().hex[:12]}",
+                user_id=current_user.id if current_user else "anonymous",
+                piece_count=detect_resp.total_detections,
+                ideas_count=0,
+                image_width=detect_resp.image_width,
+                image_height=detect_resp.image_height,
+                inference_ms=detect_resp.inference_time_ms,
+                class_counts=detect_resp.class_counts,
+                detections=[d.model_dump() for d in detect_resp.detections],
+                llm_analysis=llm_answer,
+                llm_model="gemini-2.5-flash",
+            )
+            session.add(scan)
+            await session.commit()
+            logger.info("Scan saved to DB: %s", scan.id)
+    except Exception as db_err:
+        logger.warning("Could not save scan to DB (non-fatal): %s", db_err)
+
     return AnalyzeResponse(
         **detect_resp.model_dump(),
         query=query,
@@ -638,6 +781,28 @@ async def analyze_vision(
     pil_image = bgr_to_pil(img)
 
     llm_answer = await call_gemini(context, query, pil_image=pil_image)
+
+    # ── Persist scan to PostgreSQL ────────────────────────────────────────────
+    try:
+        async with db_module.AsyncSessionLocal() as session:
+            scan = models.ScanHistory(
+                id=f"scan-{uuid.uuid4().hex[:12]}",
+                user_id="anonymous",
+                piece_count=detect_resp.total_detections,
+                ideas_count=0,
+                image_width=detect_resp.image_width,
+                image_height=detect_resp.image_height,
+                inference_ms=detect_resp.inference_time_ms,
+                class_counts=detect_resp.class_counts,
+                detections=[d.model_dump() for d in detect_resp.detections],
+                llm_analysis=llm_answer,
+                llm_model="gemini-2.5-flash",
+            )
+            session.add(scan)
+            await session.commit()
+            logger.info("Vision scan saved to DB: %s", scan.id)
+    except Exception as db_err:
+        logger.warning("Could not save scan to DB (non-fatal): %s", db_err)
 
     return AnalyzeResponse(
         **detect_resp.model_dump(),
