@@ -271,6 +271,11 @@ class AuthUserResponse(BaseModel):
     created_at: str
 
 
+class UpdateProfileRequest(BaseModel):
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None   # base64 data URI or remote URL
+
+
 class HealthResponse(BaseModel):
     status: str
     yolo_loaded: bool
@@ -549,6 +554,42 @@ async def auth_me(
 async def auth_logout():
     """Client-side logout — simply discard the JWT token."""
     return {"message": "Logged out successfully"}
+
+
+@app.patch("/auth/me", response_model=AuthUserResponse, tags=["Auth"])
+async def update_profile(
+    req: UpdateProfileRequest,
+    current_user: Optional[models.User] = Depends(get_current_user),
+    session: AsyncSession = Depends(db_module.get_db),
+):
+    """Update the authenticated user's display_name and/or avatar_url."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+
+    # Re-fetch inside this session so we can mutate it
+    result = await session.execute(
+        select(models.User).where(models.User.id == current_user.id)
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    if req.display_name is not None and req.display_name.strip():
+        user.display_name = req.display_name.strip()
+    if req.avatar_url is not None:
+        user.avatar_url = req.avatar_url   # accepts base64 data URI or URL
+
+    await session.commit()
+    logger.info("Profile updated for user: %s", user.email)
+
+    return AuthUserResponse(
+        id=user.id,
+        email=user.email,
+        display_name=user.display_name,
+        avatar_url=user.avatar_url,
+        created_at=user.created_at.isoformat(),
+    )
+
 
 
 @app.get("/", tags=["Root"])

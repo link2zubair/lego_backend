@@ -35,7 +35,7 @@ class User(Base):
     email:           Mapped[str]           = mapped_column(String(255), unique=True, nullable=False, index=True)
     display_name:    Mapped[str]           = mapped_column(String(100), nullable=False)
     hashed_password: Mapped[str]           = mapped_column(String(255), nullable=False)
-    avatar_url:      Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    avatar_url:      Mapped[Optional[str]] = mapped_column(Text,       nullable=True)
     is_active:       Mapped[bool]          = mapped_column(Boolean,     default=True)
     created_at:      Mapped[datetime]      = mapped_column(DateTime,    default=datetime.utcnow)
     updated_at:      Mapped[datetime]      = mapped_column(DateTime,    default=datetime.utcnow, onupdate=datetime.utcnow)
