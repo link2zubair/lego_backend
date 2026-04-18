@@ -19,6 +19,15 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://postgres:postgres@localhost:5432/lego_vision",
 )
 
+# Render (and many cloud providers) set DATABASE_URL with the scheme
+# "postgres://" or "postgresql://" which maps to the *synchronous* psycopg2
+# driver.  SQLAlchemy's asyncio extension requires the asyncpg driver, so we
+# rewrite the scheme here before the engine is created.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
 # ─── Engine ──────────────────────────────────────────────────────────────────
 engine = create_async_engine(
     DATABASE_URL,
