@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from ultralytics import YOLO
 import google.generativeai as genai
 from dotenv import load_dotenv
-from passlib.context import CryptContext
+import bcrypt as _bcrypt
 from jose import jwt, JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -44,16 +44,14 @@ ALGORITHM  = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
 REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 http_bearer = HTTPBearer(auto_error=False)
 
-
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
 def create_token(data: dict, expires_delta: datetime.timedelta) -> str:
