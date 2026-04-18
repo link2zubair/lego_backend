@@ -688,8 +688,7 @@ async def predict(
     iou:  float = Query(0.70, ge=0.01, le=1.0, description="IoU threshold for NMS"),
 ):
     img = read_image(file)
-    result, elapsed = run_inference(img, conf, iou)
-    return parse_results(result, img, elapsed)
+    return safe_run_inference(img, conf, iou)
 
 
 @app.post(
@@ -705,8 +704,12 @@ async def predict_annotated(
     jpeg_quality: int = Query(90, ge=10, le=100, description="Output JPEG quality"),
 ):
     img = read_image(file)
-    result, elapsed = run_inference(img, conf, iou)
-    base_resp = parse_results(result, img, elapsed)
+    base_resp = safe_run_inference(img, conf, iou)
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="YOLO model not available on this deployment. Use /analyze/vision instead.",
+        )
     annotated = draw_detections(img, base_resp)
     b64 = img_to_base64(annotated, jpeg_quality)
     return AnnotatedPredictResponse(**base_resp.model_dump(), annotated_image_base64=b64)
@@ -724,8 +727,12 @@ async def predict_image(
     iou:  float = Query(0.70, ge=0.01, le=1.0),
 ):
     img = read_image(file)
-    result, elapsed = run_inference(img, conf, iou)
-    base_resp = parse_results(result, img, elapsed)
+    base_resp = safe_run_inference(img, conf, iou)
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="YOLO model not available on this deployment. Use /analyze/vision instead.",
+        )
     annotated = draw_detections(img, base_resp)
     _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
