@@ -113,7 +113,7 @@ MODEL_PATH = Path("D:\\NewWork\\output\\detect\\train\\weights\\best.pt")
 CLASS_NAMES = ["1x2", "2x2", "3x2", "4x2"]
 
 # Load Gemini API key from environment variable (NEVER hardcode it)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDuUh-yYtUbcU8Lf4hVst2WocwrB-D-MTs")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDynpKbxTuIDiEH-yv1KpczFX7qCsA-tB0")
 
 model: Optional[YOLO] = None
 gemini_model: Optional[genai.GenerativeModel] = None
