@@ -107,7 +107,9 @@ app.add_middleware(
 )
 
 # ─── Model & LLM Config ──────────────────────────────────────────────────────
-MODEL_PATH = Path("D:\\NewWork\\output\\detect\\train\\weights\\best.pt")
+# Model path is configurable so Render / other cloud hosts don't need a hardcoded
+# Windows path. Set MODEL_PATH env var to point to your best.pt on the server.
+MODEL_PATH = Path(os.getenv("MODEL_PATH", "best.pt"))
 CLASS_NAMES = ["1x2", "2x2", "3x2", "4x2"]
 
 # Load Gemini API key from environment variable (NEVER hardcode it)
@@ -421,6 +423,30 @@ def bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
     """Convert OpenCV BGR image to PIL Image (RGB) for Gemini vision input."""
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(img_rgb)
+
+
+def safe_run_inference(img_bgr: np.ndarray, conf: float, iou: float) -> PredictResponse:
+    """
+    Run YOLO inference if the model is available.
+    If the model weights are missing (e.g. on cloud deploys without the file),
+    log a warning and return a zero-detection PredictResponse so that the
+    Gemini vision analysis can still proceed.
+    """
+    try:
+        result, elapsed = run_inference(img_bgr, conf, iou)
+        return parse_results(result, img_bgr, elapsed)
+    except RuntimeError as exc:
+        logger.warning("YOLO model unavailable — skipping detection: %s", exc)
+        h, w = img_bgr.shape[:2]
+        return PredictResponse(
+            success=True,
+            inference_time_ms=0.0,
+            image_width=w,
+            image_height=h,
+            total_detections=0,
+            detections=[],
+            class_counts={c: 0 for c in CLASS_NAMES},
+        )
 
 
 # ─── LLM Helper ──────────────────────────────────────────────────────────────
@@ -751,8 +777,7 @@ async def analyze(
     The LLM receives detection data as text (no image pixels sent).
     """
     img = read_image(file)
-    result, elapsed = run_inference(img, conf, iou)
-    detect_resp = parse_results(result, img, elapsed)
+    detect_resp = safe_run_inference(img, conf, iou)
     context = build_detection_context(detect_resp)
 
     llm_answer = await call_gemini(context, query, pil_image=None)
@@ -814,8 +839,7 @@ async def analyze_vision(
     if img is None:
         raise HTTPException(status_code=400, detail="Could not decode image.")
 
-    result, elapsed = run_inference(img, conf, iou)
-    detect_resp = parse_results(result, img, elapsed)
+    detect_resp = safe_run_inference(img, conf, iou)
     context = build_detection_context(detect_resp)
     pil_image = bgr_to_pil(img)
 
