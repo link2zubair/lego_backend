@@ -787,7 +787,17 @@ async def analyze(
     detect_resp = safe_run_inference(img, conf, iou)
     context = build_detection_context(detect_resp)
 
-    llm_answer = await call_gemini(context, query, pil_image=None)
+    # If YOLO is unavailable, override the query so Gemini analyses visually
+    effective_query = query
+    if detect_resp.total_detections == 0:
+        effective_query = (
+            "The YOLO model is not available. Please look at the image carefully "
+            "and identify any LEGO bricks you can see (their shapes and approximate counts). "
+            "Then generate 3 to 5 creative build ideas based on what you observe. "
+            "Return a valid JSON array only — no markdown, no prose."
+        )
+
+    llm_answer = await call_gemini(context, effective_query, pil_image=None)
 
     # ── Persist scan to PostgreSQL ────────────────────────────────────────────
     try:
@@ -850,7 +860,17 @@ async def analyze_vision(
     context = build_detection_context(detect_resp)
     pil_image = bgr_to_pil(img)
 
-    llm_answer = await call_gemini(context, query, pil_image=pil_image)
+    # If YOLO is unavailable, override the query so Gemini uses full vision mode
+    effective_query = query
+    if detect_resp.total_detections == 0:
+        effective_query = (
+            "The YOLO model is not available. Please look at the image carefully "
+            "and identify any LEGO bricks you can see (their shapes and approximate counts). "
+            "Then generate 3 to 5 creative build ideas based on what you observe. "
+            "Return a valid JSON array only — no markdown, no prose."
+        )
+
+    llm_answer = await call_gemini(context, effective_query, pil_image=pil_image)
 
     # ── Persist scan to PostgreSQL ────────────────────────────────────────────
     try:
