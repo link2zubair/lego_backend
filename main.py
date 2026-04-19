@@ -317,10 +317,19 @@ def read_image(upload: UploadFile) -> np.ndarray:
 
 
 def run_inference(img_bgr: np.ndarray, conf: float, iou: float):
-    """Run YOLO inference and return raw results."""
+    """Run YOLO inference and return raw results.
+    Resizes to max 640px before inference to reduce RAM usage on free tier.
+    """
     m = get_model()
+    # Resize down if larger than 640px on longest side (saves ~4× RAM)
+    h, w = img_bgr.shape[:2]
+    max_dim = 640
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        img_bgr = cv2.resize(img_bgr, (int(w * scale), int(h * scale)),
+                              interpolation=cv2.INTER_AREA)
     t0 = time.perf_counter()
-    results = m.predict(img_bgr, conf=conf, iou=iou, verbose=False)
+    results = m.predict(img_bgr, conf=conf, iou=iou, imgsz=416, verbose=False)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return results[0], elapsed_ms
 
@@ -426,6 +435,35 @@ def bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
     """Convert OpenCV BGR image to PIL Image (RGB) for Gemini vision input."""
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(img_rgb)
+
+
+def decode_image_bytes(raw_bytes: bytes) -> np.ndarray:
+    """
+    Robust image decoder that handles phone-camera JPEGs.
+
+    Many Android/iOS cameras output progressive or non-standard JPEG variants
+    that OpenCV's bundled libjpeg rejects with "Invalid SOS parameters".
+    Strategy:
+      1. Try PIL first (handles all JPEG variants including progressive).
+      2. Fall back to OpenCV if PIL fails.
+      3. Raise 400 if both fail.
+    """
+    # Try PIL (handles progressive JPEG, HEIF-derived JPEG, etc.)
+    try:
+        img_pil = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        img_rgb = np.array(img_pil, dtype=np.uint8)
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        return img_bgr
+    except Exception as pil_err:
+        logger.debug("PIL decode failed (%s), trying OpenCV.", pil_err)
+
+    # Fall back to OpenCV
+    arr = np.frombuffer(raw_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image. "
+                            "Please use JPEG or PNG format.")
+    return img
 
 
 def safe_run_inference(img_bgr: np.ndarray, conf: float, iou: float) -> PredictResponse:
@@ -803,12 +841,9 @@ async def analyze(
     and asks Gemini to answer your natural language query.
     The LLM receives detection data as text (no image pixels sent).
     """
-    # Read raw bytes so we don't fail on content_type mismatches from mobile
+    # Use robust decoder — handles progressive JPEG from phone cameras
     raw_bytes = await file.read()
-    arr = np.frombuffer(raw_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image.")
+    img = decode_image_bytes(raw_bytes)
 
     detect_resp = safe_run_inference(img, conf, iou)
     context = build_detection_context(detect_resp)
@@ -876,15 +911,20 @@ async def analyze_vision(
     This gives the LLM full visual context — it can comment on colours,
     arrangement, and anything the YOLO model may have missed.
     """
+    # Use robust decoder — handles progressive JPEG from phone cameras
     raw_bytes = await file.read()
-    arr = np.frombuffer(raw_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image.")
+    img = decode_image_bytes(raw_bytes)
 
     detect_resp = safe_run_inference(img, conf, iou)
     context = build_detection_context(detect_resp)
-    pil_image = bgr_to_pil(img)
+    # Resize image to max 640px for Gemini Vision (reduces upload size & RAM)
+    h_img, w_img = img.shape[:2]
+    if max(h_img, w_img) > 640:
+        scale = 640 / max(h_img, w_img)
+        img_small = cv2.resize(img, (int(w_img * scale), int(h_img * scale)))
+        pil_image = bgr_to_pil(img_small)
+    else:
+        pil_image = bgr_to_pil(img)
 
     # If YOLO detects nothing, tell Gemini to use its visual understanding
     effective_query = query
