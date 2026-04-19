@@ -8,6 +8,7 @@ import io
 import os
 import time
 import uuid
+import asyncio
 import datetime
 import base64
 import logging
@@ -113,7 +114,7 @@ MODEL_PATH = Path(os.getenv("MODEL_PATH", "best.pt"))
 CLASS_NAMES = ["1x2", "2x2", "3x2", "4x2"]
 
 # Load Gemini API key from environment variable ONLY — never hardcode it here.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyD1g8P0OTn88d8qC3KDsblFBlmkhRNY04Y")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 model: Optional[YOLO] = None
 gemini_model: Optional[genai.GenerativeModel] = None
@@ -168,7 +169,7 @@ def get_gemini() -> genai.GenerativeModel:
             )
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=SYSTEM_PROMPT,
         )
         logger.info("Gemini model loaded ✓")
@@ -457,6 +458,8 @@ async def call_gemini(context: str, query: str, pil_image: Optional[Image.Image]
     """
     Call Gemini with the detection context and optional image.
     Forces JSON output via response_mime_type for reliable parsing.
+    Runs the blocking generate_content() in a thread pool so it does not
+    stall the Uvicorn event loop (which caused apparent hangs / timeouts).
     """
     try:
         llm = get_gemini()
@@ -467,32 +470,34 @@ async def call_gemini(context: str, query: str, pil_image: Optional[Image.Image]
         )
 
         gen_config = genai.types.GenerationConfig(
-            max_output_tokens=16000,
-            temperature=0.7,
+            max_output_tokens=3000,
+            temperature=0.6,
             response_mime_type="application/json",
         )
 
         if pil_image is not None:
-            # Multimodal: text + image — note: response_mime_type may not work
-            # with all vision models; we try it and fall back gracefully
-            try:
-                response = llm.generate_content(
-                    [user_message, pil_image],
-                    generation_config=gen_config,
-                )
-            except Exception:
-                # Fallback without mime type enforcement for vision
-                response = llm.generate_content(
-                    [user_message, pil_image],
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=16000,
-                        temperature=0.7,
-                    ),
-                )
+            # Multimodal: text + image
+            def _vision_call():
+                try:
+                    return llm.generate_content(
+                        [user_message, pil_image],
+                        generation_config=gen_config,
+                    )
+                except Exception:
+                    # Fallback without mime type for vision models that don't support it
+                    return llm.generate_content(
+                        [user_message, pil_image],
+                        generation_config=genai.types.GenerationConfig(
+                            max_output_tokens=3000,
+                            temperature=0.6,
+                        ),
+                    )
+            response = await asyncio.to_thread(_vision_call)
         else:
-            response = llm.generate_content(
+            response = await asyncio.to_thread(
+                llm.generate_content,
                 user_message,
-                generation_config=gen_config,
+                gen_config,
             )
 
         raw_text = response.text
