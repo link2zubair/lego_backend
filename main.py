@@ -457,9 +457,8 @@ def safe_run_inference(img_bgr: np.ndarray, conf: float, iou: float) -> PredictR
 async def call_gemini(context: str, query: str, pil_image: Optional[Image.Image] = None) -> str:
     """
     Call Gemini with the detection context and optional image.
-    Forces JSON output via response_mime_type for reliable parsing.
-    Runs the blocking generate_content() in a thread pool so it does not
-    stall the Uvicorn event loop (which caused apparent hangs / timeouts).
+    Runs the blocking generate_content() in a thread pool to avoid blocking
+    the Uvicorn event loop. Always uses keyword args so nothing gets misrouted.
     """
     try:
         llm = get_gemini()
@@ -469,42 +468,56 @@ async def call_gemini(context: str, query: str, pil_image: Optional[Image.Image]
             f"Remember: Respond with ONLY a valid JSON array. No markdown, no prose."
         )
 
-        gen_config = genai.types.GenerationConfig(
+        # Generation config — JSON mime type forces structured output
+        gen_config_json = genai.types.GenerationConfig(
             max_output_tokens=3000,
-            temperature=0.6,
+            temperature=0.5,
             response_mime_type="application/json",
+        )
+        # Fallback config without mime type (for vision / older models)
+        gen_config_plain = genai.types.GenerationConfig(
+            max_output_tokens=3000,
+            temperature=0.5,
         )
 
         if pil_image is not None:
-            # Multimodal: text + image
+            # Multimodal: send text + image to Gemini Vision.
+            # Try with JSON mime type first; fall back without it.
             def _vision_call():
                 try:
                     return llm.generate_content(
                         [user_message, pil_image],
-                        generation_config=gen_config,
+                        generation_config=gen_config_json,
                     )
-                except Exception:
-                    # Fallback without mime type for vision models that don't support it
+                except Exception as inner_e:
+                    logger.warning("Vision call with JSON mime failed (%s), retrying without.", inner_e)
                     return llm.generate_content(
                         [user_message, pil_image],
-                        generation_config=genai.types.GenerationConfig(
-                            max_output_tokens=3000,
-                            temperature=0.6,
-                        ),
+                        generation_config=gen_config_plain,
                     )
             response = await asyncio.to_thread(_vision_call)
         else:
-            response = await asyncio.to_thread(
-                llm.generate_content,
-                user_message,
-                gen_config,
-            )
+            # Text-only analysis — use keyword arg (NOT positional) for generation_config
+            def _text_call():
+                try:
+                    return llm.generate_content(
+                        user_message,
+                        generation_config=gen_config_json,
+                    )
+                except Exception as inner_e:
+                    logger.warning("Text call with JSON mime failed (%s), retrying without.", inner_e)
+                    return llm.generate_content(
+                        user_message,
+                        generation_config=gen_config_plain,
+                    )
+            response = await asyncio.to_thread(_text_call)
 
         raw_text = response.text
-        logger.info("Gemini response length: %d chars", len(raw_text))
-        logger.info("Gemini response preview: %s", raw_text[:300])
+        logger.info("Gemini response: %d chars — %s", len(raw_text), raw_text[:200])
         return raw_text
 
+    except HTTPException:
+        raise  # re-raise HTTP exceptions as-is
     except Exception as e:
         logger.error("Gemini API error: %s", e)
         raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
@@ -790,16 +803,22 @@ async def analyze(
     and asks Gemini to answer your natural language query.
     The LLM receives detection data as text (no image pixels sent).
     """
-    img = read_image(file)
+    # Read raw bytes so we don't fail on content_type mismatches from mobile
+    raw_bytes = await file.read()
+    arr = np.frombuffer(raw_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image.")
+
     detect_resp = safe_run_inference(img, conf, iou)
     context = build_detection_context(detect_resp)
 
-    # If YOLO is unavailable, override the query so Gemini analyses visually
+    # If YOLO detects nothing, switch to a visual-analysis query
     effective_query = query
     if detect_resp.total_detections == 0:
         effective_query = (
-            "The YOLO model is not available. Please look at the image carefully "
-            "and identify any LEGO bricks you can see (their shapes and approximate counts). "
+            "Please look at the image carefully and identify any LEGO bricks you can see "
+            "(their shapes and approximate counts). "
             "Then generate 3 to 5 creative build ideas based on what you observe. "
             "Return a valid JSON array only — no markdown, no prose."
         )
@@ -831,8 +850,9 @@ async def analyze(
 
     return AnalyzeResponse(
         **detect_resp.model_dump(),
-        query=query,
+        query=effective_query,
         llm_analysis=llm_answer,
+        llm_model="gemini-2.0-flash",
     )
 
 
@@ -855,7 +875,6 @@ async def analyze_vision(
     Same as /analyze but also sends the original image to Gemini Vision.
     This gives the LLM full visual context — it can comment on colours,
     arrangement, and anything the YOLO model may have missed.
-    Uses gemini-2.5-flash multimodal capability.
     """
     raw_bytes = await file.read()
     arr = np.frombuffer(raw_bytes, np.uint8)
@@ -867,19 +886,19 @@ async def analyze_vision(
     context = build_detection_context(detect_resp)
     pil_image = bgr_to_pil(img)
 
-    # If YOLO is unavailable, override the query so Gemini uses full vision mode
+    # If YOLO detects nothing, tell Gemini to use its visual understanding
     effective_query = query
     if detect_resp.total_detections == 0:
         effective_query = (
-            "The YOLO model is not available. Please look at the image carefully "
-            "and identify any LEGO bricks you can see (their shapes and approximate counts). "
+            "Please look at the image carefully and identify any LEGO bricks you can see "
+            "(their types: 1x2, 2x2, 3x2, 4x2 and approximate counts). "
             "Then generate 3 to 5 creative build ideas based on what you observe. "
             "Return a valid JSON array only — no markdown, no prose."
         )
 
     llm_answer = await call_gemini(context, effective_query, pil_image=pil_image)
 
-    # ── Persist scan to PostgreSQL ────────────────────────────────────────────
+    # Persist scan (best-effort, non-fatal)
     try:
         async with db_module.AsyncSessionLocal() as session:
             scan = models.ScanHistory(
@@ -893,7 +912,7 @@ async def analyze_vision(
                 class_counts=detect_resp.class_counts,
                 detections=[d.model_dump() for d in detect_resp.detections],
                 llm_analysis=llm_answer,
-                llm_model="gemini-2.5-flash",
+                llm_model="gemini-2.0-flash",
             )
             session.add(scan)
             await session.commit()
@@ -903,8 +922,9 @@ async def analyze_vision(
 
     return AnalyzeResponse(
         **detect_resp.model_dump(),
-        query=query,
+        query=effective_query,
         llm_analysis=llm_answer,
+        llm_model="gemini-2.0-flash",
     )
 
 
