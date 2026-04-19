@@ -113,13 +113,13 @@ MODEL_PATH = Path(os.getenv("MODEL_PATH", "best.pt"))
 CLASS_NAMES = ["1x2", "2x2", "3x2", "4x2"]
 
 # Load Gemini API key from environment variable ONLY — never hardcode it here.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyD1g8P0OTn88d8qC3KDsblFBlmkhRNY04Y")
 
 model: Optional[YOLO] = None
 gemini_model: Optional[genai.GenerativeModel] = None
 
 SYSTEM_PROMPT = """You are an expert LEGO brick analyst and creative builder assistant.
-You receive YOLO detection data (brick types and counts) and must respond ONLY with a valid JSON array.
+You must respond ONLY with a valid JSON array of build ideas.
 
 RULES (strictly follow):
 1. Output ONLY a raw JSON array — no markdown fences, no ```json, no explanation text before or after.
@@ -132,9 +132,11 @@ RULES (strictly follow):
    - "estimated_minutes": integer
    - "required_pieces": array of {"shape": string, "colour": string, "count": integer}
    - "steps": array of {"step": integer, "instruction": string}
-4. Base ideas strictly on detected brick types and counts only.
+4. If YOLO detection data lists bricks, base ideas on those detected brick types and counts.
+   If YOLO found 0 bricks OR if asked to analyze visually, look at the image and identify
+   LEGO bricks by type (1x2, 2x2, 3x2, 4x2) and use those for your ideas.
 5. Each build idea must have at least 3 steps.
-6. Do NOT invent brick types not present in the detection data.
+6. Always return at least 3 build ideas — never return an empty array.
 
 Example of correct output format:
 [{"rank":1,"title":"Mini Robot","description":"A cool robot!","difficulty":"Easy","estimated_minutes":10,"required_pieces":[{"shape":"2x2 brick","colour":"any","count":4}],"steps":[{"step":1,"instruction":"Place base"},{"step":2,"instruction":"Add body"},{"step":3,"instruction":"Finish top"}]}]"""
