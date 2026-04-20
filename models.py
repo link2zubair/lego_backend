@@ -54,7 +54,7 @@ class ScanHistory(Base):
     __tablename__ = "scan_history"
 
     id:           Mapped[str]           = mapped_column(String(36),  primary_key=True, default=_uuid)
-    user_id:      Mapped[str]           = mapped_column(String(36),  ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id:      Mapped[Optional[str]] = mapped_column(String(36),  ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
 
     # Detection stats
     piece_count:  Mapped[int]           = mapped_column(Integer, default=0)
@@ -69,7 +69,7 @@ class ScanHistory(Base):
 
     # LLM output
     llm_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # raw Gemini JSON string
-    llm_model:    Mapped[str]           = mapped_column(String(50), default="gemini-2.5-flash")
+    llm_model:    Mapped[str]           = mapped_column(String(50), default="gemini-2.0-flash-lite")
 
     # Timestamps
     scanned_at:   Mapped[datetime]      = mapped_column(DateTime, default=datetime.utcnow, index=True)

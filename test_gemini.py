@@ -3,7 +3,7 @@ import warnings
 warnings.filterwarnings("ignore")
 import google.generativeai as genai
 
-API_KEY = "AIzaSyDuUh-yYtUbcU8Lf4hVst2WocwrB-D-MTs"
+API_KEY = "AIzaSyCeJ9o1Onowol1CdFAVj0TwsWVN9L-zTw0"
 genai.configure(api_key=API_KEY)
 
 SYSTEM = """You are an expert LEGO brick analyst and creative builder assistant.
