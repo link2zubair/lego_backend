@@ -33,7 +33,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import database as db_module
 import models
-import ollama_client
 
 # ─── Load environment variables ──────────────────────────────────────────────
 # Try multiple paths to find .env file (handles different working directories)
@@ -66,13 +65,8 @@ REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "best.pt"))
 CLASS_NAMES = ["1x2", "2x2", "3x2", "4x2"]
 
-# LLM Mode configuration: "gemini" | "ollama" | "hybrid"
-LLM_MODE = os.getenv("LLM_MODE", "hybrid").lower()
-if LLM_MODE not in ["gemini", "ollama", "hybrid"]:
-    LLM_MODE = "hybrid"
-    logger.warning("Invalid LLM_MODE, defaulting to 'hybrid'")
-
-logger.info(f"LLM Mode: {LLM_MODE}")
+# Using Gemini API for LLM analysis
+logger.info("📡 LLM Mode: Gemini API (with fallback to generated ideas)")
 
 # Load Gemini API key from environment variable ONLY — never hardcode it here.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyChz-bW4GYxtH3_Tj-8V9Cy0pyLTY3y0pU").strip()
@@ -646,7 +640,9 @@ def run_inference(img_bgr: np.ndarray, conf: float, iou: float):
         img_bgr = cv2.resize(img_bgr, (int(w * scale), int(h * scale)),
                               interpolation=cv2.INTER_AREA)
     t0 = time.perf_counter()
-    results = m.predict(img_bgr, conf=conf, iou=iou, imgsz=416, verbose=False)
+    # Use higher imgsz (544) for better detection of small bricks
+    # Trades slightly more compute for significantly better accuracy
+    results = m.predict(img_bgr, conf=conf, iou=iou, imgsz=544, verbose=False)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return results[0], elapsed_ms
 
@@ -903,77 +899,33 @@ async def call_gemini(context: str, query: str, pil_image: Optional[Image.Image]
 
 async def call_llm(context: str, query: str, pil_image: Optional[Image.Image] = None) -> str:
     """
-    Call LLM for build idea generation with support for:
-    - Gemini only (premium API)
-    - Ollama only (free, local)
-    - Hybrid (try Gemini first, fall back to Ollama)
+    Call Gemini LLM for build idea generation.
+    Falls back to generated ideas if quota exceeded.
     
     Returns JSON string with build ideas.
     """
     
-    if LLM_MODE == "gemini":
-        # Use Gemini only
-        logger.info("📡 Using Gemini API for LLM analysis")
+    try:
+        logger.info("📡 Attempting Gemini API...")
         return await call_gemini(context, query, pil_image=pil_image)
     
-    elif LLM_MODE == "ollama":
-        # Use Ollama only
-        logger.info("🖥️  Using local Ollama for LLM analysis")
-        if not ollama_client.is_ollama_available():
-            logger.error("❌ Ollama not available at localhost:11434")
-            raise HTTPException(
-                status_code=503, 
-                detail="Ollama server not available. Please start Ollama and try again."
-            )
-        
-        # Build brick context string for Ollama
-        brick_context = f"Detected LEGO bricks:\n{context}"
-        
-        try:
-            return await ollama_client.generate_build_ideas_ollama(brick_context, query)
-        except Exception as e:
-            logger.error(f"Ollama error: {e}")
-            raise HTTPException(status_code=502, detail=f"Ollama error: {str(e)}")
-    
-    else:  # hybrid mode
-        # Try Gemini first (better quality), fall back to Ollama
-        logger.info("🔄 Using hybrid mode: Gemini → Ollama fallback")
-        
-        try:
-            logger.info("1️⃣  Attempting Gemini API...")
-            return await call_gemini(context, query, pil_image=pil_image)
-        
-        except HTTPException as e:
-            if e.status_code == 429:
-                # Gemini quota exceeded, try Ollama
-                logger.info(f"⚠️  Gemini quota exceeded (429), trying Ollama fallback...")
-                
-                if not ollama_client.is_ollama_available():
-                    logger.error("❌ Ollama also unavailable, returning fallback ideas based on detection")
-                    class_counts = extract_class_counts_from_context(context)
-                    return generate_fallback_build_ideas(class_counts)
-                
-                try:
-                    brick_context = f"Detected LEGO bricks:\n{context}"
-                    logger.info("2️⃣  Attempting Ollama fallback...")
-                    ideas = await ollama_client.generate_build_ideas_ollama(brick_context, query)
-                    logger.info("✓ Ollama fallback successful")
-                    return ideas
-                
-                except Exception as ollama_err:
-                    logger.error(f"Ollama fallback also failed: {ollama_err}")
-                    # Last resort: use generated fallback ideas
-                    logger.info("3️⃣  Using generated fallback ideas based on detection")
-                    class_counts = extract_class_counts_from_context(context)
-                    return generate_fallback_build_ideas(class_counts)
-            else:
-                # Different Gemini error, don't fall back
-                logger.error(f"Gemini error (non-quota): {e.status_code}")
-                raise
-        
-        except Exception as e:
-            logger.error(f"Unexpected error in hybrid mode: {e}")
+    except HTTPException as e:
+        if e.status_code == 429:
+            # Gemini quota exceeded, use fallback
+            logger.warning(f"⚠️  Gemini quota exceeded (429), using generated fallback ideas...")
+            class_counts = extract_class_counts_from_context(context)
+            return generate_fallback_build_ideas(class_counts)
+        else:
+            # Different Gemini error
+            logger.error(f"Gemini error: {e.status_code}")
             raise
+    
+    except Exception as e:
+        logger.error(f"Unexpected error calling LLM: {e}")
+        # Fallback to generated ideas on any error
+        logger.info("Using generated fallback ideas based on detection")
+        class_counts = extract_class_counts_from_context(context)
+        return generate_fallback_build_ideas(class_counts)
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -1269,13 +1221,16 @@ async def analyze(
         "What bricks are visible and what could I build with them?",
         description="Natural language question about the image",
     ),
-    conf: float = Query(0.25, ge=0.01, le=1.0),
+    conf: float = Query(0.45, ge=0.01, le=1.0),
     iou:  float = Query(0.70, ge=0.01, le=1.0),
 ):
     """
     Runs YOLO detection, builds a structured context from the results,
     and asks Gemini to answer your natural language query.
     The LLM receives detection data as text (no image pixels sent).
+    
+    Default conf=0.45 filters out low-confidence false positives.
+    Lower conf for more detections, raise for stricter accuracy.
     """
     # Use robust decoder — handles progressive JPEG from phone cameras
     raw_bytes = await file.read()
@@ -1347,13 +1302,16 @@ async def analyze_vision(
         "Describe the LEGO bricks you can see and what could be built.",
         description="Natural language question about the image",
     ),
-    conf: float = Query(0.10, ge=0.01, le=1.0),
+    conf: float = Query(0.50, ge=0.01, le=1.0),
     iou:  float = Query(0.70, ge=0.01, le=1.0),
 ):
     """
     Same as /analyze but also sends the original image to Gemini Vision.
     This gives the LLM full visual context — it can comment on colours,
     arrangement, and anything the YOLO model may have missed.
+    
+    Default conf=0.50 provides high-confidence detections only.
+    Gemini Vision can identify additional bricks from visual context.
     """
     # Use robust decoder — handles progressive JPEG from phone cameras
     raw_bytes = await file.read()
